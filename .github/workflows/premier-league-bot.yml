@@ -29,8 +29,8 @@ jobs:
       - name: Write Google client secret to file
         run: |
           cat <<EOF > client_secret_183380586106-us149j4ocu1jmgekv7f24dd12ai2f75n.apps.googleusercontent.com.json
-          ${{ secrets.GOOGLE_CLIENT_SECRET_JSON }}
-          EOF
+${{ secrets.GOOGLE_CLIENT_SECRET_JSON }}
+EOF
 
       - name: Run article generation
         env:
