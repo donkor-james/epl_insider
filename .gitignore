@@ -1,0 +1,10 @@
+.env
+myenv
+token.pickle
+*.session
+__pycache__/
+*.pyc
+news.db
+pending_articles.json
+client_secret_*.json
+test_images.py
