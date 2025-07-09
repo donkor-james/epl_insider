@@ -26,6 +26,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Write Google client secret to file
+        run: |
+          cat <<EOF > client_secret_183380586106-us149j4ocu1jmgekv7f24dd12ai2f75n.apps.googleusercontent.com.json
+          ${{ secrets.GOOGLE_CLIENT_SECRET_JSON }}
+          EOF
+
       - name: Run article generation
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

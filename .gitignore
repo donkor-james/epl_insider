@@ -1,5 +1,5 @@
 .env
-myenv/
+myenv
 token.pickle
 *.session
 __pycache__/
@@ -7,4 +7,4 @@ __pycache__/
 news.db
 pending_articles.json
 client_secret_*.json
-test_images.py
+test_images.py 
