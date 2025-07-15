@@ -17,6 +17,7 @@ from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
 import urllib.parse
 from datetime import datetime, timedelta
+from bs4 import BeautifulSoup
 
 # Load environment variables from .env file
 
@@ -224,7 +225,6 @@ class RSSFeedManager:
             "https://www.bbc.co.uk/sport/football/rss.xml",
             "https://www.skysports.com/rss/0114",
             "https://www.premierleague.com/news/rss"
-            # "https://feeds.goal.com/english/news",
         ]
 
     def fetch_news(self, hours_back: int = 24) -> List[NewsItem]:
@@ -331,8 +331,46 @@ class RSSFeedManager:
 
         return has_epl_content and not has_excluded
 
+    def _scrape_main_image_from_url(self, url):
+        """Try to extract the main image from the article's HTML page."""
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (compatible; PremierLeagueBot/1.0)"
+            }
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code != 200:
+                return None
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            # Try Open Graph image first
+            og_image = soup.find("meta", property="og:image")
+            if og_image and og_image.get("content"):
+                return og_image["content"]
+
+            # Try Twitter Card image
+            twitter_image = soup.find("meta", property="twitter:image")
+            if twitter_image and twitter_image.get("content"):
+                return twitter_image["content"]
+
+            # Try first large <img> in the article
+            for img in soup.find_all("img"):
+                src = img.get("src")
+                if src and (src.startswith("http") or src.startswith("//")):
+                    # Optionally, filter out very small images
+                    try:
+                        if img.get("width") and int(img.get("width")) < 100:
+                            continue
+                    except Exception:
+                        pass
+                    return src
+
+        except Exception as e:
+            logger.warning(f"Could not scrape image from {url}: {e}")
+        return None
+
     def _extract_image_from_entry(self, entry):
-        """Extract image URL and alt text from RSS entry"""
+        """Extract image URL and alt text from RSS entry, or scrape from article page if missing."""
         image_url = None
         image_alt = ""
 
@@ -350,6 +388,11 @@ class RSSFeedManager:
                     if enclosure.type.startswith('image/'):
                         image_url = enclosure.href
                         break
+
+            if not image_url and hasattr(entry, 'link'):
+                scraped_image = self._scrape_main_image_from_url(entry.link)
+                if scraped_image:
+                    image_url = scraped_image
 
             # Check for media thumbnail
             if not image_url and hasattr(entry, 'media_thumbnail'):
@@ -578,14 +621,14 @@ class GeminiClient:
 
         Teaser Guidelines:
         - 2-3 sentences maximum (under 280 characters)
-        - MUST be extremely clickbaity, emotional, and irresistible
-        - Use strong emotional hooks: shock, excitement, controversy, suspense, FOMO (fear of missing out)
-        - Ask a provocative question or make a bold claim
-        - Use emojis to grab attention
-        - Reveal just enough to make readers desperate to know more, but NEVER spoil the main twist or detail
-        - End with a direct call to action or a cliffhanger ("Find out why...", "You won't believe what happened next...", "Full story inside!")
-        - Use words like "shocking", "unbelievable", "exclusive", "revealed", "must-see", "breaking", "fans stunned", "insider", "secret", "unexpected"
-        - Match the article type tone, but always aim to maximize curiosity and engagement
+        - Write as if you are a gossip reporter breaking the news to fans in a group chat
+        - Use a conversational, slightly dramatic, and playful tone
+        - Mix reporting facts with speculation, rumors, or "what people are saying"
+        - Intrigue the reader with a hint of controversy, surprise, or behind-the-scenes drama
+        - Use emojis to add flavor and excitement
+        - Make the reader feel like they're getting an inside scoop or hot take
+        - End with a question, cliffhanger, or call to action ("Should we believe the hype?", "Is this the start of something big?", "Full story inside!")
+        - Avoid giving away the full story—make them want to click for more!
 
         Examples of great teasers:
         • Transfer: "🚨 Shocking move on the cards? A Premier League star could be on the verge of a record-breaking transfer. Fans are stunned—find out who and why!"
@@ -1105,7 +1148,7 @@ async def process_approved_articles_as_drafts(client, config, bot, article_ids):
 
         # Create draft in Blogger
         draft_info = bot.blogger.create_draft(
-            title=generated_article['title'],
+            title=news_item.title,
             content=generated_article['content'],
             labels=['EPL News'],
             image_url=news_item.image_url,
@@ -1166,19 +1209,21 @@ async def send_draft_report_to_dm(client, draft_reports):
                 article = report['article']
                 news_item = report['news_item']
 
-                excerpt = article.get('telegram_teaser', 'No teaser available')
+                title = news_item.title
+                summary = news_item.summary if hasattr(
+                    news_item, 'summary') else title
+                excerpt = f"{summary}"
                 # Article report message (FIXED formatting)
                 article_message = f"""📖 **ARTICLE {i} OF {len(draft_reports)}**
 
-🏆 **Title:** {article['title']}
+🏆 **Title:** {title}
 
-📝 **Excerpt:** {excerpt}
 
-📊 **Source:** {news_item.source}
-🏷️ **Type:** {article.get('article_type', 'General').title()}
+🏷️ **Type:** {article.get('article_type', 'Genera').title()}
 
 🔗 **Edit Draft:** [Click to Edit]({draft_info['edit_url']})
 
+📝 **Excerpt:** {excerpt}
 ───────────────────────────────"""
 
                 # Send image with caption if available
@@ -1209,7 +1254,7 @@ async def send_draft_report_to_dm(client, draft_reports):
                 logger.error(f"Error sending individual report {i}: {e}")
                 # Send basic fallback
                 try:
-                    basic_message = f"📖 **ARTICLE {i}:** {article['title']}\n🔗 Edit: {draft_info['edit_url']}"
+                    basic_message = f"📖 **ARTICLE {i}:** {news_item.title}\nExcerpt: {excerpt} 🔗 Edit: {draft_info['edit_url']}"
                     await client.send_message(owner_chat_id, basic_message)
                 except:
                     pass

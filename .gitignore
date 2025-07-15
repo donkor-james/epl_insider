@@ -1,5 +1,4 @@
 .env
-myenv
 token.pickle
 *.session
 __pycache__/
