@@ -18,6 +18,7 @@ from io import BytesIO
 import urllib.parse
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
+import tweepy  # X (Twitter) API
 
 # Load environment variables from .env file
 
@@ -34,8 +35,16 @@ def load_env_file():
                     os.environ[key.strip()] = value.strip()
 
 
+def replace_caption_text(text: str) -> str:
+    """Replace 'Follow @premierleagueinsider' with 'Follow Us' in the given text."""
+    if not text:
+        return ""
+    return text.replace("Follow @premierleagueinsider", "Follow Us")
+
+
 # Load environment variables
 load_env_file()
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
@@ -53,6 +62,7 @@ class NewsItem:
     hash: str
     image_url: Optional[str] = None
     image_alt: Optional[str] = None
+    full_text: Optional[str] = None  # <-- Add this field
 
 
 class ArticleReviewSystem:
@@ -232,31 +242,32 @@ class RSSFeedManager:
         all_news = []
         cutoff_time = datetime.now() - timedelta(hours=hours_back)
 
+        feed_names = {
+            "https://www.bbc.co.uk/sport/football/rss.xml": "BBC Football",
+            "https://www.skysports.com/rss/0114": "Sky Sports Football",
+            "https://www.premierleague.com/news/rss": "Premier League Official"
+        }
+
         for feed_url in self.feeds:
             try:
-                logger.info(f"Fetching from: {feed_url}")
+                feed_name = feed_names.get(feed_url, feed_url)
                 feed = feedparser.parse(feed_url)
+                epl_entries = []
 
                 for entry in feed.entries[:20]:  # Limit to avoid overload
-                    # Check if entry is recent enough
                     if not self._is_recent_entry(entry, cutoff_time):
                         continue
-
-                    # Filter for English Premier League content
                     if self._is_epl_content(entry):
-                        # Extract image information
                         image_url, image_alt = self._extract_image_from_entry(
                             entry)
-
-                        # Skip entries without images
                         if not image_url:
                             logger.debug(
                                 f"Skipping entry without image: {entry.title}")
                             continue
-
                         news_hash = hashlib.md5(
                             entry.link.encode()).hexdigest()
 
+                        full_text = self._scrape_full_article_text(entry.link)
                         news_item = NewsItem(
                             title=entry.title,
                             summary=entry.summary if hasattr(
@@ -268,9 +279,20 @@ class RSSFeedManager:
                                 feed.feed, 'title') else feed_url,
                             hash=news_hash,
                             image_url=image_url,
-                            image_alt=image_alt
+                            image_alt=image_alt,
+                            full_text=full_text
                         )
+                        epl_entries.append(news_item)
                         all_news.append(news_item)
+
+                # Log summary for this feed
+                logger.info(
+                    f"[{feed_name}] EPL-relevant stories: {len(epl_entries)}")
+                for item in epl_entries:
+                    logger.info(f"[{feed_name}] - {item.title}")
+                if not epl_entries:
+                    logger.info(
+                        f"[{feed_name}] No EPL-relevant stories found.")
 
             except Exception as e:
                 logger.error(f"Error fetching from {feed_url}: {e}")
@@ -279,7 +301,6 @@ class RSSFeedManager:
         unique_news = self._remove_duplicate_stories(all_news)
         logger.info(
             f"Found {len(unique_news)} unique EPL articles after filtering")
-
         return unique_news
 
     def _is_recent_entry(self, entry, cutoff_time: datetime) -> bool:
@@ -318,7 +339,7 @@ class RSSFeedManager:
             'tottenham', 'spurs', 'west ham', 'everton', 'aston villa',
             'newcastle', 'brighton', 'crystal palace', 'fulham', 'brentford',
             'wolverhampton wanderers', 'nottingham forest', 'bournemouth', 'sheffield united',
-            'burnley', 'luton town', "spurs",
+            'burnley', 'luton town', "spurs", "fa cup"
         ]
 
         # Check if any EPL-related keywords are present
@@ -408,6 +429,36 @@ class RSSFeedManager:
 
         return image_url, image_alt
 
+    def _scrape_full_article_text(self, url):
+        """Scrape the main article text from the article's HTML page."""
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (compatible; PremierLeagueBot/1.0)"
+            }
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code != 200:
+                return None
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            # Try to find main content by common tags/classes
+            article_tags = soup.find_all(['article'])
+            if article_tags:
+                text = ' '.join(tag.get_text(separator=' ', strip=True)
+                                for tag in article_tags)
+                if len(text) > 300:
+                    return text
+
+            # Fallback: get all <p> tags inside main content
+            paragraphs = soup.find_all('p')
+            text = ' '.join(p.get_text(separator=' ', strip=True)
+                            for p in paragraphs)
+            return text if len(text) > 300 else None
+        except Exception as e:
+            logger.warning(
+                f"Could not scrape full article text from {url}: {e}")
+        return None
+
     def _remove_duplicate_stories(self, news_items: List[NewsItem]) -> List[NewsItem]:
         """Remove duplicate stories based on content similarity"""
         unique_items = []
@@ -424,9 +475,9 @@ class RSSFeedManager:
 class NewsAnalyzer:
     def __init__(self):
         self.high_value_keywords = [
-            'transfer', 'signing', 'injury', 'suspended', 'banned', 'record',
+            'transfer', 'signing', 'sign', 'injury', 'suspended', 'banned', 'record',
             'goal', 'hat-trick', 'winner', 'defeat', 'victory', 'comeback',
-            'debut', 'milestone', 'controversy', 'red card', 'penalty'
+            'debut', 'milestone', 'controversy', 'red card', 'penalty', 'VAR', 'epl'
         ]
 
     def is_football_content(self, news_item: NewsItem) -> bool:
@@ -450,7 +501,7 @@ class NewsAnalyzer:
 
         # Big club names (higher engagement)
         big_clubs = ['manchester united', 'liverpool',
-                     'arsenal', 'chelsea', 'manchester city', 'tottenham']
+                     'arsenal', 'chelsea', 'manchester city', 'tottenham', 'newcastle']
         for club in big_clubs:
             if club in content:
                 score += 3
@@ -494,178 +545,228 @@ class GeminiClient:
         self.api_key = api_key
         self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={self.api_key}"
 
-        # Multiple journalist personalities - rotated randomly
-        self.journalist_personas = [
+        # Legitimate analysis approaches - no fake personas
+        self.analysis_styles = [
             {
-                'name': 'Marcus Thompson',
-                'style': 'Hard-hitting investigative reporter with insider knowledge',
-                'tone': 'Confident, direct, sometimes controversial',
-                'signature': 'Always includes behind-the-scenes details and rarely mentioned facts',
-                'endings': ['leaves readers with burning questions', 'reveals unexpected connections', 'hints at bigger developments']
+                'approach': 'tactical_breakdown',
+                'focus': 'Formation analysis, playing style, and strategic fit',
+                'tone': 'Educational and detailed, using football terminology',
+                'signature': 'Breaks down complex tactics with clear explanations',
+                'data_sources': 'Formation data, playing statistics, tactical trends'
             },
             {
-                'name': 'Sarah Mitchell',
-                'style': 'Tactical expert who explains the game beautifully',
-                'tone': 'Educational but passionate, uses analogies',
-                'signature': 'Breaks down complex tactics in simple terms with vivid imagery',
-                'endings': ['tactical predictions', 'strategic implications', 'formation analysis']
+                'approach': 'market_analysis',
+                'focus': 'Transfer values, financial implications, and market trends',
+                'tone': 'Business-focused and data-driven',
+                'signature': 'Analyzes deals within broader market context',
+                'data_sources': 'Transfer fees, market values, financial reports'
             },
             {
-                'name': 'James Rodriguez',
-                'style': 'Old-school storyteller with emotional depth',
-                'tone': 'Nostalgic, emotional, connects past to present',
-                'signature': 'Weaves historical context and human stories into every piece',
-                'endings': ['emotional resonance', 'historical parallels', 'human impact focus']
+                'approach': 'performance_analysis',
+                'focus': 'Statistical review and performance metrics',
+                'tone': 'Analytical and evidence-based',
+                'signature': 'Uses statistics to predict impact and success',
+                'data_sources': 'Performance stats, historical data, comparative analysis'
             },
             {
-                'name': 'Alex Chen',
-                'style': 'Data-driven analyst who finds hidden patterns',
-                'tone': 'Analytical but accessible, reveals surprising stats',
-                'signature': 'Uncovers statistics and trends others miss',
-                'endings': ['statistical revelations', 'trend predictions', 'number-based insights']
+                'approach': 'historical_context',
+                'focus': 'Comparing to past situations and precedents',
+                'tone': 'Contextual and comparative',
+                'signature': 'Draws parallels with similar past events',
+                'data_sources': 'Historical records, past transfers, archived data'
             },
             {
-                'name': 'Danny Williams',
-                'style': 'Fan-first writer who captures the emotion',
-                'tone': 'Enthusiastic, relatable, speaks like a passionate fan',
-                'signature': 'Writes from the heart, captures fan emotions perfectly',
-                'endings': ['fan reaction focus', 'emotional impact', 'community response']
+                'approach': 'strategic_impact',
+                'focus': 'Long-term implications for club strategy',
+                'tone': 'Forward-thinking and strategic',
+                'signature': 'Analyzes broader implications for club direction',
+                'data_sources': 'Club strategies, competitive analysis, trend data'
             }
         ]
 
-        # Dynamic writing structures - no fixed templates
-        self.narrative_approaches = [
-            'chronological_story', 'reverse_reveal', 'character_focus',
-            'conflict_resolution', 'mystery_unveiling', 'dramatic_buildup',
-            'conversational_style', 'investigative_report', 'personal_reflection'
+        # Legitimate analytical angles only
+        self.content_angles = {
+            'transfer_analysis': [
+                'tactical_system_fit',
+                'market_value_assessment',
+                'squad_depth_impact',
+                'age_profile_implications',
+                'positional_competition_analysis',
+                'contract_structure_implications'
+            ],
+            'performance_review': [
+                'statistical_trend_analysis',
+                'comparative_performance_study',
+                'consistency_evaluation',
+                'key_metrics_breakdown',
+                'seasonal_progression_tracking'
+            ],
+            'tactical_analysis': [
+                'formation_compatibility_study',
+                'playing_style_integration',
+                'tactical_flexibility_assessment',
+                'system_evolution_implications',
+                'positional_role_analysis'
+            ],
+            'injury_analysis': [
+                'squad_rotation_implications',
+                'tactical_adjustment_requirements',
+                'depth_chart_reshuffling',
+                'opportunity_cost_analysis',
+                'recovery_timeline_impact'
+            ],
+            'general_analysis': [
+                'competitive_landscape_assessment',
+                'season_trajectory_implications',
+                'momentum_shift_evaluation',
+                'pressure_point_identification',
+                'expectation_reality_analysis'
+            ]
+        }
+
+        # Varied writing structures for natural variety
+        self.narrative_structures = [
+            'data_first_approach',  # Lead with statistics
+            'tactical_breakdown_focus',  # Formation/system analysis
+            'comparative_analysis',  # Compare to similar situations
+            'chronological_development',  # Track progression over time
+            'impact_assessment',  # Focus on implications
+            'problem_solution_format',  # Identify issue and analyze solution
+            'trend_analysis_approach',  # Broader pattern recognition
+            'contextual_deep_dive'  # Historical and market context
         ]
 
-        # Varied conclusion styles
-        self.conclusion_styles = [
-            'open_question', 'bold_prediction', 'call_to_action', 'emotional_resonance',
-            'surprising_twist', 'historical_parallel', 'future_implications', 'personal_opinion',
-            'fan_challenge', 'tactical_breakdown', 'psychological_insight', 'no_conclusion'
+        # Professional conclusion styles
+        self.conclusion_approaches = [
+            'prediction_based_on_data',
+            'key_factors_to_monitor',
+            'comparative_outlook',
+            'timeline_expectations',
+            'success_metrics_identification',
+            'broader_implications_summary',
+            'analytical_verdict',
+            'trend_continuation_assessment'
         ]
 
     def generate_article(self, news_item: NewsItem) -> Optional[Dict[str, str]]:
-        """Generate completely unique, human-like articles with rotating personalities"""
+        """Generate legitimate analytical articles with varied approaches"""
         import random
 
-        # Randomly select journalist persona
-        persona = random.choice(self.journalist_personas)
-        narrative = random.choice(self.narrative_approaches)
-        conclusion = random.choice(self.conclusion_styles)
+        # Select analysis approach
+        style = random.choice(self.analysis_styles)
+        structure = random.choice(self.narrative_structures)
+        conclusion = random.choice(self.conclusion_approaches)
 
-        # Determine content focus dynamically
-        content_angle = self._get_unique_angle(news_item)
+        # Determine content angle based on news type
+        content_angle = self._get_analytical_angle(news_item)
+        article_text = news_item.full_text if news_item.full_text else news_item.summary
 
-        # Create completely dynamic prompt
-        dynamic_prompt = f"""
-        You are {persona['name']}, a Premier League journalist known for: {persona['style']}
+        # Create analytical prompt
+        analytical_prompt = f"""
+        You are a professional football analyst writing an expert analysis piece.
         
-        Your writing style: {persona['tone']}
-        Your signature approach: {persona['signature']}
+        ANALYSIS APPROACH: {style['approach']}
+        Writing Focus: {style['focus']}
+        Tone: {style['tone']}
+        Signature Style: {style['signature']}
+        Data Sources to Reference: {style['data_sources']}
         
-        ASSIGNMENT: Write about this news using the "{narrative}" narrative approach:
-        CRITICAL INSTRUCTION: Write this article WITHOUT EVER mentioning "{persona['name']}" or any journalist names. You are writing as an anonymous expert with this personality style.
-
-        NEVER write phrases like:
-        - "As {persona['name']}"
-        - "I'm {persona['name']}"  
-        - "This is {persona['name']} reporting"
-        - Or any variation that identifies you by name
-
-        Write with {persona['name']}'s expertise and style but remain anonymous.
-
-        News: {news_item.title}
-        Details: {news_item.summary}
+        NEWS TO ANALYZE:
+        Title: {news_item.title}
+        Article: {article_text}
         Source: {news_item.source}
         
-        UNIQUE ANGLE TO EXPLORE: {content_angle}
+        ANALYTICAL ANGLE: {content_angle}
+        NARRATIVE STRUCTURE: {structure}
+        CONCLUSION STYLE: {conclusion}
         
-        WRITING INSTRUCTIONS:
+        CRITICAL REQUIREMENTS:
         
-        1. **BE COMPLETELY UNIQUE**: No article should ever sound similar to another
-        2. **VARY YOUR STRUCTURE**: Don't follow any template or pattern
-        3. **WRITE LIKE {persona['name']}**: Stay in character throughout
-        5. **NEVER MENTION YOUR NAME**: Don't ever include your name in the articles 
-        5. **BE UNPREDICTABLE**: Surprise readers with your approach
-        6. **AVOID AI PATTERNS**: Write like you've been covering football for 15 years
+        🔴 NEVER FABRICATE:
+        - Do NOT claim insider sources or "sources say"
+        - Do NOT invent quotes or conversations
+        - Do NOT make up behind-the-scenes drama
+        - Do NOT create fictional details
         
-        SPECIFIC APPROACH FOR THIS ARTICLE:
-        - Use the "{narrative}" storytelling method
-        - Focus on: {content_angle}
-        - End with: {conclusion} style conclusion
-        - Length: {random.randint(400, 700)} words (vary this naturally)
+        ✅ LEGITIMATE ANALYSIS ONLY:
+        - Base all analysis on publicly available information
+        - Use phrases like "The data suggests...", "Analysis indicates...", "This pattern shows..."
+        - Reference observable statistics, historical records, public statements
+        - Compare to similar documented cases
+        - Draw conclusions from verifiable trends
         
-        HUMANIZATION REQUIREMENTS:
-        ✅ Use contractions (I'll, won't, it's, that's)
-        ✅ Include personal opinions and hot takes
-        ✅ Add conversational phrases ("Look,", "Here's the thing,", "Let me be clear")
-        ✅ Use rhetorical questions naturally
-        ✅ Include slang and football terminology
-        ✅ Vary sentence length dramatically (short punchy ones mixed with longer flowing ones)
-        ✅ Show personality and bias
-        ✅ Include insider knowledge or "sources say" elements
-        ✅ Use emotional language when appropriate
-        ✅ Reference other games, players, or situations naturally
-        ✅ Add unexpected tangents that real journalists include
+        CONTENT REQUIREMENTS:
         
-        VARY THESE ELEMENTS EVERY TIME:
-        - Opening hook (question, statement, story, statistic, quote)
-        - Paragraph structure (some long, some short, some single sentences)
-        - Transition words and phrases
-        - Conclusion style (never the same approach twice)
-        - Personality injection points
-        - Opinion vs fact balance
-
-        Teaser Guidelines:
-        - 2-3 sentences maximum (under 280 characters)
-        - Write as if you are a gossip reporter breaking the news to fans in a group chat
-        - Use a conversational, slightly dramatic, and playful tone
-        - Mix reporting facts with speculation, rumors, or "what people are saying"
-        - Intrigue the reader with a hint of controversy, surprise, or behind-the-scenes drama
-        - Use emojis to add flavor and excitement
-        - Make the reader feel like they're getting an inside scoop or hot take
-        - End with a question, cliffhanger, or call to action ("Should we believe the hype?", "Is this the start of something big?", "Full story inside!")
-        - Avoid giving away the full story—make them want to click for more!
-
-        Examples of great teasers:
-        • Transfer: "🚨 Shocking move on the cards? A Premier League star could be on the verge of a record-breaking transfer. Fans are stunned—find out who and why!"
-        • Controversy: "😱 What really happened behind the scenes at [Stadium]? The truth is more explosive than anyone imagined. Full story inside!"
-        • Injury: "💔 Devastating blow for [Team] as a key player goes down. The scans reveal something no one expected. Details you can't miss!"
-        • Drama: "🔥 Tempers flared and secrets spilled—what unfolded in the dressing room left everyone speechless. You won't believe the inside story!"
-
+        1. **Statistical Foundation**: Include relevant performance metrics, transfer values, or tactical data
         
-        CONTENT DEPTH OPTIONS (pick randomly):
-        {random.choice([
-            "Deep tactical analysis with formation breakdowns",
-            "Behind-the-scenes drama and personality conflicts", 
-            "Financial implications and transfer market impact",
-            "Fan culture and emotional responses",
-            "Historical comparisons and precedents",
-            "Manager psychology and decision-making",
-            "Player development and career trajectories",
-            "Club politics and boardroom decisions"
+        2. **Historical Context**: Reference similar past situations or precedents where applicable
+        
+        3. **Tactical Analysis**: Explain formations, playing styles, or strategic implications using football knowledge
+        
+        4. **Market Context**: Position within broader transfer market or competitive landscape
+        
+        5. **Evidence-Based Predictions**: Make forecasts based on observable patterns, not speculation
+        
+        WRITING STYLE GUIDELINES:
+        
+        ✅ Professional but engaging tone
+        ✅ Use football terminology appropriately  
+        ✅ Vary sentence length naturally
+        ✅ Include rhetorical questions for engagement
+        ✅ Use analytical transitions ("However, the data shows...", "In contrast to...", "This suggests...")
+        ✅ Reference specific examples from football history
+        ✅ Explain complex concepts clearly
+        ✅ Show expertise through detailed knowledge
+        ✅ Use contractions for natural flow
+        ✅ Include opinion based on analysis, not fabrication
+        
+        STRUCTURE FOR THIS ARTICLE:
+        - Use the "{structure}" narrative approach
+        - Focus analytical lens on: {content_angle}
+        - Conclude with: {conclusion} style ending
+        - Target length: {random.randint(450, 650)} words
+        
+        SPECIFIC ANALYTICAL DEPTH:
+        Focus your analysis on: {random.choice([
+            'Statistical performance patterns and trend analysis',
+            'Tactical system integration and formation implications', 
+            'Market positioning and financial strategy assessment',
+            'Historical precedent comparison and outcome prediction',
+            'Competitive advantage analysis and strategic impact',
+            'Performance metrics evaluation and success probability',
+            'Timeline analysis and development trajectory mapping',
+            'Risk assessment and potential challenge identification'
         ])}
         
-        Remember: You're {persona['name']}, not an AI. Write with the passion, knowledge, and personality of someone who lives and breathes Premier League football.
+        TEASER REQUIREMENTS:
+        Create a professional, analytical teaser that:
+        - Highlights the key analytical insight (2-3 sentences, under 280 characters)
+        - Uses analytical language ("Analysis reveals...", "Data shows...", "Key insight:")
+        - Focuses on the most interesting finding or implication
+        - Maintains professional tone while being engaging
+        - Ends with intrigue about the full analysis
+        - NO drama or gossip language
+        - NO fake insider claims
         
-        Also create a Telegram teaser that matches {persona['name']}'s personality and the {narrative} approach.
+        Example analytical teasers:
+        • "Analysis reveals this transfer could reshape the entire tactical approach. The numbers tell a fascinating story about long-term strategy."
+        • "Key insight: Performance data suggests a major shift in playing style is imminent. What the metrics really show might surprise you."
+        • "Market analysis indicates this deal represents more than just a signing. The strategic implications run deeper than expected."
         
         Response format (JSON):
         {{
-            "title": "Your unique headline (in {persona['name']}'s style)",
-            "content": "Full article content in HTML format (completely unique structure)",
-            "telegram_teaser": "Engaging teaser matching the persona and approach",
+            "title": "Professional analytical headline",
+            "content": "Full analytical article in HTML format with evidence-based insights",
+            "telegram_teaser": "Professional analytical teaser focusing on key insight",
             "article_type": "{content_angle}",
-            "approach": "{narrative}"
+            "analysis_approach": "{style['approach']}",
+            "structure_used": "{structure}"
         }}
         """
 
         try:
             headers = {"Content-Type": "application/json"}
-            data = {"contents": [{"parts": [{"text": dynamic_prompt}]}]}
+            data = {"contents": [{"parts": [{"text": analytical_prompt}]}]}
 
             response = requests.post(self.base_url, headers=headers, json=data)
 
@@ -673,76 +774,82 @@ class GeminiClient:
                 result = response.json()
                 content = result['candidates'][0]['content']['parts'][0]['text']
 
+                logger.debug(f"Gemini analytical response: {content}")
+
                 # Extract JSON from response
                 json_start = content.find('{')
                 json_end = content.rfind('}') + 1
                 if json_start != -1 and json_end != -1:
                     article_json = json.loads(content[json_start:json_end])
 
-                    # Add metadata for tracking variety
-                    article_json['persona_used'] = persona['name']
-                    article_json['narrative_approach'] = narrative
-                    article_json['conclusion_style'] = conclusion
+                    # Add metadata for tracking analytical variety
+                    article_json['analysis_style'] = style['approach']
+                    article_json['narrative_structure'] = structure
+                    article_json['conclusion_approach'] = conclusion
 
                     return article_json
 
         except Exception as e:
-            logger.error(f"Error generating article with Gemini: {e}")
+            logger.error(f"Error generating analytical article: {e}")
 
         return None
 
-    def _get_unique_angle(self, news_item: NewsItem) -> str:
-        """Determine unique content angle based on news item"""
+    def _get_analytical_angle(self, news_item: NewsItem) -> str:
+        """Determine legitimate analytical angle based on news content"""
         import random
 
         title_lower = news_item.title.lower()
         summary_lower = news_item.summary.lower()
         content = f"{title_lower} {summary_lower}"
 
-        # Dynamic angle detection with multiple possibilities per topic
-        angles = []
+        # Determine news category and select appropriate analytical angles
+        if any(word in content for word in ['transfer', 'signing', 'bid', 'move', 'deal']):
+            return random.choice(self.content_angles['transfer_analysis'])
 
-        if any(word in content for word in ['transfer', 'signing', 'bid', 'linked']):
-            angles.extend([
-                'transfer_market_psychology', 'financial_fair_play_impact', 'agent_power_dynamics',
-                'player_career_crossroads', 'club_ambition_signals', 'fan_expectation_management'
-            ])
+        elif any(word in content for word in ['injury', 'fitness', 'medical', 'surgery', 'recovery']):
+            return random.choice(self.content_angles['injury_analysis'])
 
-        if any(word in content for word in ['injury', 'fitness', 'medical', 'surgery']):
-            angles.extend([
-                'medical_team_expertise', 'player_mentality_test', 'squad_depth_revelation',
-                'tactical_adaptation_necessity', 'insurance_policy_activation', 'career_defining_moment'
-            ])
+        elif any(word in content for word in ['tactics', 'formation', 'strategy', 'system', 'style']):
+            return random.choice(self.content_angles['tactical_analysis'])
 
-        if any(word in content for word in ['tactics', 'formation', 'strategy']):
-            angles.extend([
-                'tactical_evolution_story', 'manager_philosophy_clash', 'player_development_approach',
-                'opposition_preparation_insight', 'system_adaptation_mastery', 'football_intelligence_showcase'
-            ])
+        elif any(word in content for word in ['performance', 'stats', 'goals', 'assists', 'form']):
+            return random.choice(self.content_angles['performance_review'])
 
-        if any(word in content for word in ['controversy', 'investigation', 'dispute']):
-            angles.extend([
-                'institutional_integrity_test', 'precedent_setting_case', 'power_structure_challenge',
-                'regulatory_effectiveness_question', 'public_trust_implications', 'governance_evolution_moment'
-            ])
+        else:
+            return random.choice(self.content_angles['general_analysis'])
 
-        if any(word in content for word in ['match', 'game', 'result', 'performance']):
-            angles.extend([
-                'momentum_shift_analysis', 'psychological_warfare_element', 'tactical_chess_match',
-                'individual_brilliance_showcase', 'team_chemistry_indicator', 'season_narrative_changer'
-            ])
+    def _ensure_analytical_quality(self, article_content: str) -> bool:
+        """Validate that article maintains analytical standards"""
 
-        # Add universal angles that work for any story
-        universal_angles = [
-            'media_narrative_deconstruction', 'fan_culture_reflection', 'business_strategy_insight',
-            'personality_profile_deep_dive', 'competitive_dynamics_analysis', 'cultural_impact_assessment',
-            'legacy_building_perspective', 'pressure_point_identification', 'expectation_reality_gap',
-            'decision_making_psychology', 'leadership_challenge_examination', 'identity_crisis_exploration'
+        # Red flag phrases that indicate fabrication
+        red_flags = [
+            'sources tell me', 'insider reveals', 'behind closed doors',
+            'dressing room sources', 'club insider', 'my sources',
+            'confidential information', 'off the record'
         ]
 
-        angles.extend(universal_angles)
+        content_lower = article_content.lower()
 
-        return random.choice(angles) if angles else 'comprehensive_analysis'
+        # Check for fabrication red flags
+        for flag in red_flags:
+            if flag in content_lower:
+                logger.warning(f"Article contains red flag phrase: {flag}")
+                return False
+
+        # Ensure analytical language is present
+        analytical_indicators = [
+            'analysis', 'data', 'statistics', 'indicates', 'suggests',
+            'trend', 'pattern', 'metrics', 'comparison', 'historical'
+        ]
+
+        analytical_count = sum(
+            1 for indicator in analytical_indicators if indicator in content_lower)
+
+        if analytical_count < 3:
+            logger.warning("Article lacks sufficient analytical language")
+            return False
+
+        return True
 
 
 class BloggerClient:
@@ -1119,6 +1226,130 @@ class PremierLeagueNewsBot:
                 f"Generated {articles_generated} articles and sent for review")
 
 
+class XPoster:
+    def __init__(self, consumer_key, consumer_secret, access_token, access_token_secret, posted_file="posted_to_x.json"):
+        self.posted_file = posted_file
+        self.api = None
+        self.posted_ids = set()
+        self._load_posted()
+        self._authenticate(consumer_key, consumer_secret,
+                           access_token, access_token_secret)
+
+    def _authenticate(self, consumer_key, consumer_secret, access_token, access_token_secret):
+        try:
+            auth = tweepy.OAuth1UserHandler(
+                consumer_key, consumer_secret, access_token, access_token_secret)
+            self.api = tweepy.API(auth)
+        except Exception as e:
+            print(f"Error authenticating with X API: {e}")
+
+    def _load_posted(self):
+        try:
+            if os.path.exists(self.posted_file):
+                with open(self.posted_file, "r", encoding="utf-8") as f:
+                    self.posted_ids = set(json.load(f))
+        except Exception as e:
+            print(f"Error loading posted X IDs: {e}")
+
+    def _save_posted(self):
+        try:
+            with open(self.posted_file, "w", encoding="utf-8") as f:
+                json.dump(list(self.posted_ids), f)
+        except Exception as e:
+            print(f"Error saving posted X IDs: {e}")
+
+    def has_posted(self, telegram_message_id):
+        return str(telegram_message_id) in self.posted_ids
+
+    def mark_posted(self, telegram_message_id):
+        self.posted_ids.add(str(telegram_message_id))
+        self._save_posted()
+
+    def post_to_x(self, text, image_url=None):
+        try:
+            if image_url:
+                filename = "temp_x_image.jpg"
+                r = requests.get(image_url)
+                with open(filename, "wb") as f:
+                    f.write(r.content)
+                media = self.api.media_upload(filename)
+                tweet = self.api.update_status(
+                    status=text, media_ids=[media.media_id])
+                os.remove(filename)
+            else:
+                tweet = self.api.update_status(status=text)
+            return tweet.id
+        except Exception as e:
+            print(f"Error posting to X: {e}")
+            return None
+
+
+# --- New: Event-driven Telegram-to-X sync using message handler ---
+def setup_telegram_to_x_sync(app, xposter, channel_id):
+    from pyrogram import filters
+    from pyrogram.types import Message
+
+    def extract_hashtags(text, max_tags=3):
+        import re
+        # List of EPL and football keywords for hashtags
+        keywords = [
+            'Premier League', 'EPL', 'Football', 'Soccer', 'Transfer', 'Goal', 'Injury', 'VAR',
+            'Arsenal', 'Chelsea', 'Liverpool', 'Manchester United', 'Man United', 'Man City', 'Manchester City',
+            'Tottenham', 'Spurs', 'West Ham', 'Everton', 'Aston Villa', 'Newcastle', 'Brighton',
+            'Crystal Palace', 'Fulham', 'Brentford', 'Wolves', 'Wolverhampton', 'Nottingham Forest',
+            'Bournemouth', 'Sheffield United', 'Burnley', 'Luton Town', 'FA Cup', 'Champions League'
+        ]
+        text_lower = text.lower()
+        found = []
+        for kw in keywords:
+            # Match whole words, ignore case
+            if re.search(r'\\b' + re.escape(kw.lower()) + r'\\b', text_lower):
+                tag = '#' + kw.replace(' ', '')
+                if tag not in found:
+                    found.append(tag)
+            if len(found) >= max_tags:
+                break
+        # If not enough, add top 1-2 unique words from text (longer than 5 chars, not common stopwords)
+        if len(found) < max_tags:
+            stopwords = set(['the', 'and', 'for', 'with', 'that', 'from', 'this', 'have', 'will', 'your', 'about', 'after', 'could', 'their', 'which', 'more', 'than', 'when', 'where', 'what', 'who', 'been', 'into', 'over', 'just', 'like',
+                            'they', 'but', 'are', 'has', 'was', 'you', 'all', 'out', 'now', 'his', 'her', 'him', 'she', 'our', 'its', 'not', 'can', 'get', 'had', 'new', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten'])
+            words = re.findall(r'\\b[a-zA-Z]{5,}\\b', text)
+            for w in words:
+                wl = w.lower()
+                tag = '#' + w.capitalize()
+                if wl not in stopwords and tag not in found:
+                    found.append(tag)
+                if len(found) >= max_tags:
+                    break
+        return found
+
+    @app.on_message(filters.channel & filters.chat(channel_id))
+    async def handle_new_channel_post(client, message: Message):
+        # Only process text or caption messages
+        if not message.text and not message.caption:
+            return
+        telegram_id = message.message_id
+        if xposter.has_posted(telegram_id):
+            return
+        text = message.caption if message.caption else message.text
+        # You must define replace_caption_text somewhere in your code
+        text = replace_caption_text(text)
+        hashtags = extract_hashtags(text)
+        if hashtags:
+            # Add hashtags at the end, avoid duplicates
+            text = text.strip() + '\n' + ' '.join(hashtags)
+        image_url = None
+        if message.photo:
+            image_url = await client.download_media(message.photo, file_name="temp_sync_photo.jpg")
+        tweet_id = xposter.post_to_x(text, image_url=image_url)
+        if tweet_id:
+            xposter.mark_posted(telegram_id)
+            print(
+                f"Posted Telegram message {telegram_id} to X as tweet {tweet_id}")
+        if image_url and os.path.exists(image_url):
+            os.remove(image_url)
+
+
 async def process_approved_articles_as_drafts(client, config, bot, article_ids):
     """Process articles as drafts and send comprehensive report"""
     draft_reports = []
@@ -1216,16 +1447,13 @@ async def send_draft_report_to_dm(client, draft_reports):
                 # Article report message (FIXED formatting)
                 article_message = f"""📖 **ARTICLE {i} OF {len(draft_reports)}**
 
-🏆 **Title:** {title}
-
-
-🏷️ **Type:** {article.get('article_type', 'Genera').title()}
-
 🔗 **Edit Draft:** [Click to Edit]({draft_info['edit_url']})
 
 📝 **Excerpt:** {excerpt}
-───────────────────────────────"""
 
+Image Source: [{news_item.source if news_item.source else "Unknown"}]
+Follow @premierleagueinsider for more premier league news!
+"""
                 # Send image with caption if available
                 if news_item.image_url:
                     try:
@@ -1308,6 +1536,14 @@ def main():
         'posts_per_job': 4
     }
 
+    def get_x_config():
+        return {
+            "consumer_key": os.getenv("X_CONSUMER_KEY"),
+            "consumer_secret": os.getenv("X_CONSUMER_SECRET"),
+            "access_token": os.getenv("X_ACCESS_TOKEN"),
+            "access_token_secret": os.getenv("X_ACCESS_TOKEN_SECRET")
+        }
+
     # Initialize the bot
     bot = PremierLeagueNewsBot(config)
     bot.review_system.clear_old_articles()
@@ -1318,6 +1554,14 @@ def main():
         api_id=config['telegram_api_id'],
         api_hash=config['telegram_api_hash'],
         bot_token=config['telegram_bot_token']
+    )
+
+    x_config = get_x_config()
+    xposter = XPoster(
+        x_config["consumer_key"],
+        x_config["consumer_secret"],
+        x_config["access_token"],
+        x_config["access_token_secret"]
     )
 
     async def run_daily_cycle_and_create_drafts():
@@ -1395,6 +1639,28 @@ def main():
         await bot_client.start()
         logger.info("✅ Bot client started!")
 
+        # Setup Telegram-to-X sync
+        setup_telegram_to_x_sync(
+            bot_client, xposter, config['telegram_channel_id'])
+        logger.info("✅ Telegram-to-X sync setup complete!")
+
+        async def periodic_news_cycle():
+            while True:
+                logger.info("Running scheduled news cycle...")
+                await run_daily_cycle_and_create_drafts()
+                await asyncio.sleep(14400)  # 4 hours
+
+        # async def periodic_telegram_to_x():
+        #     while True:
+        #         logger.info("Running scheduled Telegram-to-X sync...")
+        #         await sync_telegram_to_x(bot_client, xposter, config['telegram_channel_id'])
+        #         await asyncio.sleep(7200)  # 2 hours
+        #     # Start periodic tasks
+
+        await asyncio.gather(
+            periodic_news_cycle(),
+        )
+
         try:
             # Get bot info
             bot_info = await bot_client.get_me()
@@ -1407,7 +1673,7 @@ def main():
 ✅ Automated draft creation is now active
 📰 Will generate up to 4 articles and create drafts
 📱 You'll receive detailed reports with images and excerpts
-🔄 Running every 3 hours
+🔄 Running every 4 hours
 
 🎯 **What happens:**
 1. Bot finds Premier League news
@@ -1430,11 +1696,11 @@ def main():
 
             logger.info("🤖 Bot running in automated draft mode!")
 
-            # Keep running - check every 3 hours
-            while True:
-                await asyncio.sleep(7200)  # 3 hours
-                logger.info("Running scheduled news cycle...")
-                await run_daily_cycle_and_create_drafts()
+            # # Keep running - check every 4 hours
+            # while True:
+            #     await asyncio.sleep(7200)  # 4 hours
+            #     logger.info("Running scheduled news cycle...")
+            #     await run_daily_cycle_and_create_drafts()
 
         except Exception as e:
             logger.error(f"Error in run_bot: {e}")
